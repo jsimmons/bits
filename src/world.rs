@@ -19,6 +19,7 @@ struct Archtype {
     chunks: Vec<ChunkId>,
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct ThingId(u32);
 
 struct Thing {
@@ -32,6 +33,8 @@ struct Chunk {
     len: u32,
     data: [u8; CHUNK_BYTES],
 }
+
+pub struct Query {}
 
 pub struct World<'registry> {
     registry: &'registry Registry,
