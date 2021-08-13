@@ -14,7 +14,7 @@ pub struct RingBuf<T> {
 impl<T> RingBuf<T> {
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two());
-        assert!(capacity <= u32::MAX as usize);
+        assert!(capacity < (u32::MAX / 2) as usize);
         let layout = Layout::array::<T>(capacity).expect("capacity overflow");
         let ptr = unsafe { std::mem::transmute::<*mut u8, *mut T>(alloc::alloc(layout)) };
         if ptr.is_null() {
@@ -88,9 +88,11 @@ impl<T> RingBuf<T> {
     pub fn iter(&self) -> Iter<T> {
         let head = self.head;
         let tail = self.tail;
+        let mask = self.mask;
         Iter::<T> {
             head,
             tail,
+            mask,
             ring: unsafe { self.buffer_as_slice() },
         }
     }
@@ -98,9 +100,11 @@ impl<T> RingBuf<T> {
     pub fn iter_mut(&mut self) -> IterMut<T> {
         let head = self.head;
         let tail = self.tail;
+        let mask = self.mask;
         IterMut::<T> {
             head,
             tail,
+            mask,
             ring: unsafe { self.buffer_as_mut_slice() },
         }
     }
@@ -195,12 +199,31 @@ pub struct Iter<'a, T: 'a> {
     ring: &'a [T],
     head: u32,
     tail: u32,
+    mask: u32,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.head == self.tail {
+            None
+        } else {
+            unsafe {
+                let offset = (self.tail & self.mask) as usize;
+                let value = self.ring.get_unchecked(offset);
+                self.tail = self.tail.wrapping_add(1);
+                Some(value)
+            }
+        }
+    }
 }
 
 pub struct IterMut<'a, T: 'a> {
     ring: &'a mut [T],
     head: u32,
     tail: u32,
+    mask: u32,
 }
 
 #[cfg(test)]
