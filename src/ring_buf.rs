@@ -1,4 +1,4 @@
-use std::{iter::FromIterator, mem::MaybeUninit};
+use std::{iter::FromIterator, marker::PhantomData, mem::MaybeUninit};
 
 use crate::helpers;
 
@@ -103,7 +103,8 @@ impl<T, const N: usize> RingBuf<T, N> {
             head: self.head,
             tail: self.tail,
             mask: Self::MASK,
-            ring: unsafe { self.buffer_as_mut_slice() },
+            ring: unsafe { self.buffer_as_mut_slice() as *mut [T] },
+            phantom: PhantomData,
         }
     }
 
@@ -208,14 +209,45 @@ impl<'a, T> Iterator for Iter<'a, T> {
             }
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.head.wrapping_sub(self.tail) as usize;
+        (len, Some(len))
+    }
 }
 
+impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
+
 pub struct IterMut<'a, T: 'a> {
-    ring: &'a mut [T],
+    ring: *mut [T],
     head: u32,
     tail: u32,
     mask: u32,
+    phantom: PhantomData<&'a mut [T]>,
 }
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.head == self.tail {
+            None
+        } else {
+            unsafe {
+                let value = (self.ring as *mut T).add((self.tail & self.mask) as usize);
+                self.tail = self.tail.wrapping_add(1);
+                Some(&mut *value)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.head.wrapping_sub(self.tail) as usize;
+        (len, Some(len))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
 
 impl<A, const N: usize> Extend<A> for RingBuf<A, N> {
     fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T) {
@@ -242,9 +274,12 @@ impl<A, const N: usize> FromIterator<A> for RingBuf<A, N> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use super::*;
 
     #[test]
+    #[ignore]
     fn large_table() {
         let mut ring_buf = RingBuf::<u32, 2147483648>::new();
         for i in 0..2147483648 {
@@ -324,7 +359,7 @@ mod tests {
         let mut ring_buf = RingBuf::<_, 128>::new();
         assert!(ring_buf.iter().next().is_none());
 
-        {
+        for _ in 0..2 {
             for i in 0..100 {
                 ring_buf.push_back(i);
                 assert_eq!(ring_buf.len(), i + 1);
@@ -343,21 +378,84 @@ mod tests {
                 assert_eq!(ring_buf.pop_front(), Some(i));
             }
         }
+    }
 
-        {
+    #[test]
+    fn iterator_mut() {
+        let mut ring_buf = RingBuf::<_, 128>::new();
+
+        for _ in 0..2 {
             for i in 0..100 {
                 ring_buf.push_back(i);
-                assert_eq!(ring_buf.len(), i + 1);
-                assert_eq!(ring_buf.iter().count(), i + 1);
             }
 
-            {
-                let mut i = 0;
-                for x in ring_buf.iter() {
-                    assert_eq!(i, *x);
-                    i += 1
-                }
+            for x in ring_buf.iter_mut() {
+                *x += 100;
             }
+
+            for i in 0..100 {
+                assert_eq!(ring_buf.pop_front(), Some(i + 100));
+            }
+        }
+    }
+
+    #[test]
+    fn drop_order() {
+        struct X<'a> {
+            index: u32,
+            counter: &'a AtomicU32,
+        }
+
+        impl<'a> Drop for X<'a> {
+            fn drop(&mut self) {
+                assert_eq!(
+                    self.counter
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    self.index
+                );
+            }
+        }
+
+        {
+            let counter = AtomicU32::new(0);
+            let mut ring_buf = RingBuf::<_, 128>::new();
+
+            for i in 0..100 {
+                ring_buf.push_back(X {
+                    index: i,
+                    counter: &counter,
+                });
+            }
+            drop(ring_buf);
+
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 100)
+        }
+
+        {
+            let counter = AtomicU32::new(0);
+            let mut ring_buf = RingBuf::<_, 128>::new();
+            for i in 0..100 {
+                ring_buf.push_back(X {
+                    index: i,
+                    counter: &counter,
+                });
+            }
+
+            for _ in 0..100 {
+                ring_buf.pop_front();
+            }
+
+            counter.store(0, std::sync::atomic::Ordering::Relaxed);
+
+            for i in 0..100 {
+                ring_buf.push_back(X {
+                    index: i,
+                    counter: &counter,
+                });
+            }
+            drop(ring_buf);
+
+            assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 100)
         }
     }
 }
