@@ -1,39 +1,36 @@
-use std::{
-    alloc::{self, Layout},
-    ptr::NonNull,
-};
+use std::{iter::FromIterator, mem::MaybeUninit};
 
-pub struct RingBuf<T> {
+use crate::helpers;
+
+pub struct RingBuf<T, const N: usize> {
     head: u32,
     tail: u32,
-    mask: u32,
-    cap: u32,
-    ptr: NonNull<T>,
+    data: Box<[MaybeUninit<T>; N]>,
 }
 
-impl<T> RingBuf<T> {
-    pub fn new(capacity: usize) -> Self {
-        assert!(capacity.is_power_of_two());
-        assert!(capacity < (u32::MAX / 2) as usize);
-        let layout = Layout::array::<T>(capacity).expect("capacity overflow");
-        let ptr = unsafe { std::mem::transmute::<*mut u8, *mut T>(alloc::alloc(layout)) };
-        if ptr.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
-        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+#[cold]
+#[inline(never)]
+fn capacity_assert_failed() {
+    panic!("RingBuf is full")
+}
 
+impl<T, const N: usize> RingBuf<T, N> {
+    const MASK: u32 = (N - 1) as u32;
+
+    pub fn new() -> Self {
+        assert!(N.is_power_of_two());
+        assert!(N <= (1 << 31));
+        assert!(N > 0);
         Self {
             head: 0,
             tail: 0,
-            mask: (capacity - 1) as u32,
-            cap: capacity as u32,
-            ptr,
+            data: helpers::box_uninit_array(), //Box::new(helpers::uninit_array()),
         }
     }
 
     #[inline]
     pub fn is_full(&self) -> bool {
-        self.head - self.tail == self.cap
+        self.head.wrapping_sub(self.tail) == (N as u32)
     }
 
     #[inline]
@@ -43,42 +40,49 @@ impl<T> RingBuf<T> {
 
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap as usize
+        N
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        (self.head - self.tail) as usize
+        self.head.wrapping_sub(self.tail) as usize
     }
 
-    /// Turn ptr into a slice
     #[inline]
     unsafe fn buffer_as_slice(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.capacity()) }
+        std::mem::transmute::<&[MaybeUninit<_>; N], &[_; N]>(&*self.data)
     }
 
-    /// Turn ptr into a mut slice
     #[inline]
     unsafe fn buffer_as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity()) }
+        std::mem::transmute::<&mut [MaybeUninit<_>; N], &mut [_; N]>(&mut *self.data)
     }
 
+    #[inline]
     pub fn push_back(&mut self, value: T) {
-        assert!(!self.is_full());
-        unsafe {
-            let offset = (self.head & self.mask) as isize;
-            std::ptr::write(self.ptr.as_ptr().offset(offset), value);
-            self.head = self.head.wrapping_add(1);
+        if self.is_full() {
+            capacity_assert_failed()
         }
+        unsafe {
+            self.data
+                .get_unchecked_mut((self.head & Self::MASK) as usize)
+                .as_mut_ptr()
+                .write(value);
+        }
+        self.head = self.head.wrapping_add(1);
     }
 
+    #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
         if self.is_empty() {
             None
         } else {
             unsafe {
-                let offset = (self.tail & self.mask) as isize;
-                let value = std::ptr::read(self.ptr.as_ptr().offset(offset));
+                let value = std::ptr::read(
+                    self.data
+                        .get_unchecked((self.tail & Self::MASK) as usize)
+                        .as_ptr(),
+                );
                 self.tail = self.tail.wrapping_add(1);
                 Some(value)
             }
@@ -86,25 +90,19 @@ impl<T> RingBuf<T> {
     }
 
     pub fn iter(&self) -> Iter<T> {
-        let head = self.head;
-        let tail = self.tail;
-        let mask = self.mask;
         Iter::<T> {
-            head,
-            tail,
-            mask,
+            head: self.head,
+            tail: self.tail,
+            mask: Self::MASK,
             ring: unsafe { self.buffer_as_slice() },
         }
     }
 
     pub fn iter_mut(&mut self) -> IterMut<T> {
-        let head = self.head;
-        let tail = self.tail;
-        let mask = self.mask;
         IterMut::<T> {
-            head,
-            tail,
-            mask,
+            head: self.head,
+            tail: self.tail,
+            mask: Self::MASK,
             ring: unsafe { self.buffer_as_mut_slice() },
         }
     }
@@ -113,8 +111,8 @@ impl<T> RingBuf<T> {
     pub fn as_slices(&self) -> (&[T], &[T]) {
         unsafe {
             let buf = self.buffer_as_slice();
-            let head = (self.head & self.mask) as usize;
-            let tail = (self.tail & self.mask) as usize;
+            let head = (self.head & Self::MASK) as usize;
+            let tail = (self.tail & Self::MASK) as usize;
             RingSlices::ring_slices(buf, head, tail)
         }
     }
@@ -122,15 +120,15 @@ impl<T> RingBuf<T> {
     #[inline]
     pub fn as_mut_slices(&mut self) -> (&mut [T], &mut [T]) {
         unsafe {
-            let head = (self.head & self.mask) as usize;
-            let tail = (self.tail & self.mask) as usize;
+            let head = (self.head & Self::MASK) as usize;
+            let tail = (self.tail & Self::MASK) as usize;
             let buf = self.buffer_as_mut_slice();
             RingSlices::ring_slices(buf, head, tail)
         }
     }
 }
 
-impl<T> Drop for RingBuf<T> {
+impl<T, const N: usize> Drop for RingBuf<T, N> {
     fn drop(&mut self) {
         /// Runs the destructor for all items in the slice when it gets dropped (normally or
         /// during unwinding).
@@ -149,12 +147,6 @@ impl<T> Drop for RingBuf<T> {
             let _back_dropper = Dropper(back);
             // use drop for [T]
             std::ptr::drop_in_place(front);
-        }
-
-        let layout = Layout::array::<T>(self.cap as usize).expect("capacity overflow");
-        unsafe {
-            let ptr = std::mem::transmute::<*mut T, *mut u8>(self.ptr.as_ptr());
-            alloc::dealloc(ptr, layout)
         }
     }
 }
@@ -210,8 +202,7 @@ impl<'a, T> Iterator for Iter<'a, T> {
             None
         } else {
             unsafe {
-                let offset = (self.tail & self.mask) as usize;
-                let value = self.ring.get_unchecked(offset);
+                let value = self.ring.get_unchecked((self.tail & self.mask) as usize);
                 self.tail = self.tail.wrapping_add(1);
                 Some(value)
             }
@@ -226,37 +217,147 @@ pub struct IterMut<'a, T: 'a> {
     mask: u32,
 }
 
+impl<A, const N: usize> Extend<A> for RingBuf<A, N> {
+    fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T) {
+        for value in iter.into_iter() {
+            self.push_back(value)
+        }
+    }
+}
+
+impl<'a, T: 'a + Copy, const N: usize> Extend<&'a T> for RingBuf<T, N> {
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().cloned());
+    }
+}
+
+impl<A, const N: usize> FromIterator<A> for RingBuf<A, N> {
+    fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> RingBuf<A, N> {
+        let iterator = iter.into_iter();
+        let mut deq = RingBuf::new();
+        deq.extend(iterator);
+        deq
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
-        let mut ring_buf = RingBuf::new(4);
-        ring_buf.push_back(1);
-        ring_buf.push_back(2);
-        ring_buf.push_back(3);
-        ring_buf.push_back(4);
+    fn large_table() {
+        let mut ring_buf = RingBuf::<u32, 2147483648>::new();
+        for i in 0..2147483648 {
+            ring_buf.push_back(i);
+        }
         assert!(ring_buf.is_full());
-        assert_eq!(ring_buf.pop_front(), Some(1));
-        assert_eq!(ring_buf.pop_front(), Some(2));
-        assert_eq!(ring_buf.pop_front(), Some(3));
-        assert_eq!(ring_buf.pop_front(), Some(4));
-        assert!(ring_buf.is_empty());
     }
 
     #[test]
-    fn push_pop() {
-        let mut ring_buf = RingBuf::new(256);
-        for _ in 0..10 {
+    fn small_table() {
+        let mut ring_buf = RingBuf::<u32, 1>::new();
+        ring_buf.push_back(0);
+        assert!(ring_buf.is_full());
+    }
+
+    #[test]
+    fn push_pop_wrap() {
+        let mut ring_buf = RingBuf::<_, 256>::new();
+        // Adjust the zero position so we wrap half way through a push sequence.
+        ring_buf.head = 0xffff_ffff - 100;
+        ring_buf.tail = 0xffff_ffff - 100;
+        for _ in 0..2 {
             for i in 0..200 {
                 ring_buf.push_back(i);
+                assert_eq!(ring_buf.len(), (i + 1) as usize);
             }
             assert_eq!(ring_buf.len(), 200);
             for i in 0..200 {
                 assert_eq!(ring_buf.pop_front(), Some(i));
+                assert_eq!(ring_buf.len(), (199 - i) as usize);
             }
         }
         assert_eq!(ring_buf.len(), 0);
+    }
+
+    #[test]
+    fn empty_full() {
+        let mut ring_buf = RingBuf::<_, 2>::new();
+        assert!(ring_buf.is_empty());
+        assert!(!ring_buf.is_full());
+
+        ring_buf.push_back(1);
+        assert!(!ring_buf.is_full());
+        assert!(!ring_buf.is_empty());
+
+        ring_buf.push_back(2);
+        assert!(!ring_buf.is_empty());
+        assert!(ring_buf.is_full());
+
+        assert_eq!(ring_buf.pop_front(), Some(1));
+        assert!(!ring_buf.is_full());
+        assert!(!ring_buf.is_empty());
+
+        assert_eq!(ring_buf.pop_front(), Some(2));
+        assert!(ring_buf.is_empty());
+        assert!(!ring_buf.is_full());
+
+        ring_buf.push_back(1);
+        assert!(!ring_buf.is_full());
+        assert!(!ring_buf.is_empty());
+
+        ring_buf.push_back(2);
+        assert!(ring_buf.is_full());
+        assert!(!ring_buf.is_empty());
+
+        assert_eq!(ring_buf.pop_front(), Some(1));
+        assert!(!ring_buf.is_full());
+        assert!(!ring_buf.is_empty());
+
+        assert_eq!(ring_buf.pop_front(), Some(2));
+        assert!(ring_buf.is_empty());
+        assert!(!ring_buf.is_full());
+    }
+
+    #[test]
+    fn iterator() {
+        let mut ring_buf = RingBuf::<_, 128>::new();
+        assert!(ring_buf.iter().next().is_none());
+
+        {
+            for i in 0..100 {
+                ring_buf.push_back(i);
+                assert_eq!(ring_buf.len(), i + 1);
+                assert_eq!(ring_buf.iter().count(), i + 1);
+            }
+
+            {
+                let mut i = 0;
+                for x in ring_buf.iter() {
+                    assert_eq!(i, *x);
+                    i += 1
+                }
+            }
+
+            for i in 0..100 {
+                assert_eq!(ring_buf.pop_front(), Some(i));
+            }
+        }
+
+        {
+            for i in 0..100 {
+                ring_buf.push_back(i);
+                assert_eq!(ring_buf.len(), i + 1);
+                assert_eq!(ring_buf.iter().count(), i + 1);
+            }
+
+            {
+                let mut i = 0;
+                for x in ring_buf.iter() {
+                    assert_eq!(i, *x);
+                    i += 1
+                }
+            }
+        }
     }
 }

@@ -1,5 +1,6 @@
 mod blit;
 mod depot;
+mod helpers;
 mod maths;
 mod raw_table;
 mod registry;
